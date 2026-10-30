@@ -1,0 +1,447 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p chessapp && cd chessapp
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ChessOverlay"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.chessoverlay"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.chessoverlay"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Chess Overlay"
+                  android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Drawing a chess move arrow over other apps" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/chessoverlay
+          cat > app/src/main/java/com/example/chessoverlay/MainActivity.kt <<'EOF_FILE'
+          package com.example.chessoverlay
+
+          import android.Manifest
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val info = TextView(this).apply {
+                      text = "Оверлей для шахмат.\n\n" +
+                          "1. Разрешите «Поверх других приложений».\n" +
+                          "2. Нажмите «Запустить».\n" +
+                          "3. Откройте шахматное приложение.\n" +
+                          "4. Кнопка ⌖ — подгоните рамку под доску " +
+                          "(палец двигает, щипок меняет размер).\n" +
+                          "5. Введите ход, например e2e4, и нажмите ▶."
+                      textSize = 16f
+                  }
+                  val start = Button(this).apply {
+                      text = "Запустить оверлей"
+                      setOnClickListener { startOverlay() }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Остановить"
+                      setOnClickListener { stopService(Intent(this@MainActivity, OverlayService::class.java)) }
+                  }
+
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(48, 96, 48, 48)
+                      addView(info)
+                      addView(start)
+                      addView(stop)
+                  })
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+              }
+
+              private fun startOverlay() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                      return
+                  }
+                  startForegroundService(Intent(this, OverlayService::class.java))
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/chessoverlay
+          cat > app/src/main/java/com/example/chessoverlay/ArrowView.kt <<'EOF_FILE'
+          package com.example.chessoverlay
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.MotionEvent
+          import android.view.ScaleGestureDetector
+          import android.view.View
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          class ArrowView(context: Context) : View(context) {
+
+              var boardX = 80f
+              var boardY = 500f
+              var boardSize = 920f
+              var flipped = false
+              var calibrating = false
+                  set(v) { field = v; invalidate() }
+              var move: String? = null
+                  set(v) { field = v; invalidate() }
+
+              private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.argb(200, 255, 140, 0); style = Paint.Style.FILL_AND_STROKE
+              }
+              private val squarePaint = Paint().apply { color = Color.argb(90, 255, 140, 0) }
+              private val framePaint = Paint().apply {
+                  color = Color.argb(220, 0, 200, 255); style = Paint.Style.STROKE; strokeWidth = 4f
+              }
+              private val gridPaint = Paint().apply {
+                  color = Color.argb(110, 0, 200, 255); strokeWidth = 2f
+              }
+
+              private val scaler = ScaleGestureDetector(context,
+                  object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScale(d: ScaleGestureDetector): Boolean {
+                          val cx = boardX + boardSize / 2
+                          val cy = boardY + boardSize / 2
+                          boardSize = (boardSize * d.scaleFactor).coerceIn(200f, max(width, height).toFloat())
+                          boardX = cx - boardSize / 2
+                          boardY = cy - boardSize / 2
+                          invalidate()
+                          return true
+                      }
+                  })
+              private var lastX = 0f
+              private var lastY = 0f
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (!calibrating) return false
+                  scaler.onTouchEvent(e)
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> { lastX = e.x; lastY = e.y }
+                      MotionEvent.ACTION_MOVE -> if (e.pointerCount == 1 && !scaler.isInProgress) {
+                          boardX += e.x - lastX
+                          boardY += e.y - lastY
+                          lastX = e.x; lastY = e.y
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> {
+                          val i = if (e.actionIndex == 0) min(1, e.pointerCount - 1) else 0
+                          lastX = e.getX(i); lastY = e.getY(i)
+                      }
+                  }
+                  return true
+              }
+
+              private fun center(file: Int, rank: Int): PointF {
+                  val cell = boardSize / 8
+                  val col = if (flipped) 7 - file else file
+                  val row = if (flipped) rank else 7 - rank
+                  return PointF(boardX + (col + 0.5f) * cell, boardY + (row + 0.5f) * cell)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  if (calibrating) {
+                      c.drawRect(boardX, boardY, boardX + boardSize, boardY + boardSize, framePaint)
+                      val cell = boardSize / 8
+                      for (i in 1..7) {
+                          c.drawLine(boardX + i * cell, boardY, boardX + i * cell, boardY + boardSize, gridPaint)
+                          c.drawLine(boardX, boardY + i * cell, boardX + boardSize, boardY + i * cell, gridPaint)
+                      }
+                  }
+                  val m = move ?: return
+                  val f1 = m[0] - 'a'; val r1 = m[1] - '1'
+                  val f2 = m[2] - 'a'; val r2 = m[3] - '1'
+                  val cell = boardSize / 8
+                  val a = center(f1, r1)
+                  val b = center(f2, r2)
+
+                  c.drawRect(a.x - cell / 2, a.y - cell / 2, a.x + cell / 2, a.y + cell / 2, squarePaint)
+                  c.drawRect(b.x - cell / 2, b.y - cell / 2, b.x + cell / 2, b.y + cell / 2, squarePaint)
+
+                  val ang = atan2(b.y - a.y, b.x - a.x)
+                  val head = cell * 0.45f
+                  arrowPaint.strokeWidth = cell * 0.18f
+                  val bx = b.x - cos(ang) * head * 0.6f
+                  val by = b.y - sin(ang) * head * 0.6f
+                  c.drawLine(a.x, a.y, bx, by, arrowPaint)
+
+                  val p = Path().apply {
+                      moveTo(b.x, b.y)
+                      lineTo(b.x - head * cos(ang - 0.45f), b.y - head * sin(ang - 0.45f))
+                      lineTo(b.x - head * cos(ang + 0.45f), b.y - head * sin(ang + 0.45f))
+                      close()
+                  }
+                  c.drawPath(p, arrowPaint)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/chessoverlay
+          cat > app/src/main/java/com/example/chessoverlay/OverlayService.kt <<'EOF_FILE'
+          package com.example.chessoverlay
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+
+          class OverlayService : Service() {
+
+              private lateinit var wm: WindowManager
+              private lateinit var arrow: ArrowView
+              private lateinit var panel: LinearLayout
+              private lateinit var arrowLp: WindowManager.LayoutParams
+              private lateinit var panelLp: WindowManager.LayoutParams
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  startAsForeground()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+                  // Слой со стрелкой: на весь экран, касания проходят сквозь него
+                  arrow = ArrowView(this)
+                  arrowLp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  wm.addView(arrow, arrowLp)
+
+                  // Панель управления (перетаскивается за значок ≡)
+                  panel = buildPanel()
+                  panelLp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 20; y = 150
+                  }
+                  wm.addView(panel, panelLp)
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildPanel(): LinearLayout {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(Color.argb(220, 30, 30, 30))
+                      setPadding(dp(4), dp(4), dp(4), dp(4))
+                  }
+
+                  val handle = TextView(this).apply {
+                      text = "≡"; textSize = 22f; setTextColor(Color.WHITE)
+                      setPadding(dp(8), 0, dp(8), 0)
+                      var sx = 0f; var sy = 0f; var px = 0; var py = 0
+                      setOnTouchListener { _, e ->
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; px = panelLp.x; py = panelLp.y }
+                              MotionEvent.ACTION_MOVE -> {
+                                  panelLp.x = px + (e.rawX - sx).toInt()
+                                  panelLp.y = py + (e.rawY - sy).toInt()
+                                  wm.updateViewLayout(panel, panelLp)
+                              }
+                          }
+                          true
+                      }
+                  }
+
+                  val input = EditText(this).apply {
+                      hint = "e2e4"; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
+                      textSize = 16f; setSingleLine(true)
+                      minWidth = dp(80)
+                      // Для ввода текста окну нужен фокус
+                      setOnTouchListener { v, e ->
+                          if (e.action == MotionEvent.ACTION_DOWN) setFocusable(true)
+                          v.performClick()
+                          false
+                      }
+                  }
+
+                  fun btn(label: String, action: () -> Unit) = Button(this).apply {
+                      text = label
+                      minWidth = dp(44); minimumWidth = dp(44)
+                      setPadding(0, 0, 0, 0)
+                      setOnClickListener { action() }
+                  }
+
+                  val show = btn("▶") {
+                      val m = input.text.toString().lowercase().filter { it.isLetterOrDigit() }
+                      if (Regex("^[a-h][1-8][a-h][1-8]").containsMatchIn(m)) {
+                          arrow.move = m.take(4)
+                      } else {
+                          Toast.makeText(this, "Формат: e2e4", Toast.LENGTH_SHORT).show()
+                      }
+                      releaseFocus(input)
+                  }
+                  val clear = btn("✕") { arrow.move = null; input.setText(""); releaseFocus(input) }
+                  val calib = btn("⌖") {
+                      arrow.calibrating = !arrow.calibrating
+                      if (arrow.calibrating) arrowLp.flags = arrowLp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      else arrowLp.flags = arrowLp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                      wm.updateViewLayout(arrow, arrowLp)
+                  }
+                  val flip = btn("⇅") { arrow.flipped = !arrow.flipped; arrow.invalidate() }
+                  val quit = btn("⏻") { stopSelf() }
+
+                  listOf(handle, input, show, clear, calib, flip, quit).forEach { root.addView(it) }
+                  return root
+              }
+
+              private fun releaseFocus(v: android.view.View) {
+                  panelLp.flags = panelLp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                  wm.updateViewLayout(panel, panelLp)
+                  (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                      .hideSoftInputFromWindow(v.windowToken, 0)
+              }
+
+              private fun startAsForeground() {
+                  val channelId = "overlay"
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(channelId, "Оверлей", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n: Notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("Chess Overlay работает")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .build()
+                  val type = if (Build.VERSION.SDK_INT >= 34)
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+                  ServiceCompat.startForeground(this, 1, n, type)
+              }
+
+              override fun onDestroy() {
+                  runCatching { wm.removeView(arrow) }
+                  runCatching { wm.removeView(panel) }
+                  super.onDestroy(
